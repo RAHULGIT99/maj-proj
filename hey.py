@@ -5,6 +5,7 @@ import asyncio
 import random
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import requests
@@ -43,6 +44,14 @@ pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
 # FASTAPI + MODELS
 # -------------------------
 app = FastAPI(title="Dynamic Web-to-RAG API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AnalyzeRequest(BaseModel):
     urls: List[str] = Field(..., description="List of public URLs to scrape and index.")
