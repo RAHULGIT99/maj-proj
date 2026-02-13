@@ -1,57 +1,19 @@
-import os
 import uuid
-import tempfile
 import asyncio
 import random
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException, Header
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-import requests
-from trafilatura import extract as trafilatura_extract
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 import httpx
 from langchain.embeddings.base import Embeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
 from pinecone import Pinecone, ServerlessSpec
+from config import PINECONE_API_KEY, GROQ_API_KEYS, EMBEDDING_API_URL, EMBEDDING_API_BATCH_SIZE, API_KEY
+from scraper import fetch_and_combine
 
-load_dotenv()
-
-# -------------------------
-# CONFIG / KEYS
-# -------------------------
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-if not PINECONE_API_KEY:
-    raise ValueError("PINECONE_API_KEY not set in env")
-
-API_KEY = os.getenv("API_KEY")  # optional auth for your endpoints
-
-# Groq keys for failover
-GROQ_API_KEYS = [k for k in (os.getenv("GROQ_API_KEY_1"), os.getenv("GROQ_API_KEY_2"), os.getenv("GROQ_API_KEY_3")) if k]
-if not GROQ_API_KEYS:
-    raise ValueError("At least one GROQ_API_KEY_x environment variable must be set")
-
-EMBEDDING_API_URL =  "https://rahulbro123-embedding-model.hf.space/get_embeddings"
-EMBEDDING_API_BATCH_SIZE = int(os.getenv("EMBEDDING_API_BATCH_SIZE", "32")) 
-
-# Pinecone client (serverless)
+# Pinecone client
 pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
-
-# -------------------------
-# FASTAPI + MODELS
-# -------------------------
-app = FastAPI(title="Dynamic Web-to-RAG API", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 class AnalyzeRequest(BaseModel):
     urls: List[str] = Field(..., description="List of public URLs to scrape and index.")
@@ -61,9 +23,14 @@ class AnalyzeResponse(BaseModel):
     index_name: Optional[str]
     summary: Optional[str]
 
+class ChatMessage(BaseModel):
+    role: str
+    text: str
+
 class AskRequest(BaseModel):
     index_name: str = Field(..., description="Dynamic index name returned by /analyze")
     question: str = Field(..., description="User question to answer from the index")
+    history: Optional[List[ChatMessage]] = Field(default=[], description="Previous conversation messages for context")
 
 class AskResponse(BaseModel):
     answer: str
@@ -110,76 +77,21 @@ class RemoteEmbeddingClient(Embeddings):
 embeddings = RemoteEmbeddingClient(api_url=EMBEDDING_API_URL, batch_size=EMBEDDING_API_BATCH_SIZE)
 
 # -------------------------
-# SCRAPER: static + JS fallback
-# -------------------------
-def extract_static(url: str, timeout: int = 12):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/123.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "*/*"
-        }
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        html = resp.text
-        text = trafilatura_extract(html)
-        if text and len(text.strip()) > 200:
-            return text
-        # fallback to BS
-        soup = BeautifulSoup(html, "html.parser")
-        raw = soup.get_text("\n", strip=True)
-        if raw and len(raw.strip()) > 200:
-            return raw
-        return None
-    except Exception as e:
-        print("extract_static error:", e)
-        return None
-
-def extract_js(url: str, timeout: int = 30):
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=timeout*1000, wait_until="networkidle")
-            html = page.content()
-            browser.close()
-        text = trafilatura_extract(html)
-        if text and len(text.strip()) > 200:
-            return text
-        soup = BeautifulSoup(html, "html.parser")
-        raw = soup.get_text("\n", strip=True)
-        if raw and len(raw.strip()) > 200:
-            return raw
-        return None
-    except Exception as e:
-        print("extract_js error:", e)
-        return None
-
-async def fetch_and_combine(urls: List[str]) -> str:
-    parts = []
-    loop = asyncio.get_running_loop()
-    for url in urls:
-        # Try static quickly (run sync in threadpool)
-        text = await asyncio.to_thread(extract_static, url)
-        if not text:
-            # Try JS
-            text = await asyncio.to_thread(extract_js, url)
-        if not text:
-            parts.append(f"[Could not extract content from: {url}]")
-        else:
-            # optional: add small header for origin
-            parts.append(f"--- SOURCE: {url} ---\n{text}\n")
-    combined = "\n\n".join(parts).strip()
-    return combined
-
-# -------------------------
 # PINECONE HELPERS (async wrappers)
 # -------------------------
 async def create_index_if_not_exists_async(index_name: str, dimension: int = 768):
     def _sync():
         names = pinecone_client.list_indexes().names()
         if index_name not in names:
+            # Feature: if > 5 indexes, delete one then create one
+            if len(names) >= 5:
+                to_delete = names[0]
+                print(f"Index limit reached ({len(names)} >= 5). Deleting old index: {to_delete}")
+                try:
+                    pinecone_client.delete_index(to_delete)
+                except Exception as e:
+                    print(f"Error deleting index {to_delete}: {e}")
+
             print(f"Creating index {index_name}")
             pinecone_client.create_index(
                 name=index_name,
@@ -227,7 +139,8 @@ async def generate_summary_with_groq(combined_text: str) -> str:
     prompt = (
         "You are an experienced equity research analyst. "
         "Given the combined extracted content below from multiple web pages, produce a concise, "
-        "professional, user-friendly analyst summary in about 10 short lines. "
+        "professional, user-friendly analyst summary . "
+        "Just include everything dont miss anything basically give an overview of the content which was given."
         "Focus on the most important facts, company profile, key metrics or indices mentioned, "
         "and any notable points. Use short sentences and clear language.\n\n"
         "CONTENT:\n"
@@ -273,11 +186,22 @@ async def optimize_text_for_rag(text: str) -> str:
     print("Optimization failed, using original text.")
     return text
 
-async def answer_with_context_groq(question: str, context: str) -> str:
+async def answer_with_context_groq(question: str, context: str, history: Optional[List] = None) -> str:
+    history_block = ""
+    if history:
+        lines = []
+        for msg in history[-10:]:  # Last 10 messages max
+            role = msg.role if hasattr(msg, 'role') else msg.get('role', '')
+            text = msg.text if hasattr(msg, 'text') else msg.get('text', '')
+            lines.append(f"{role.upper()}: {text}")
+        history_block = "CONVERSATION HISTORY:\n" + "\n".join(lines) + "\n\n"
+
     prompt = (
         "You are a helpful assistant. Answer only based on the CONTEXT below. "
         "If the answer is not present in the context, say: 'I could not find the answer in the provided documents.' "
+        "Use the conversation history to understand follow-up questions. "
         "Be concise and formal.\n\n"
+        f"{history_block}"
         f"CONTEXT:\n{context}\n\nQUESTION: {question}\nANSWER:"
     )
     shuffled_keys = random.sample(GROQ_API_KEYS, len(GROQ_API_KEYS))
@@ -293,9 +217,22 @@ async def answer_with_context_groq(question: str, context: str) -> str:
     return "The answer could not be generated due to an external service error."
 
 # -------------------------
+# HELPER: search top-k and return combined context
+# -------------------------
+def _search_index_sync(index_name: str, query_vector: list, top_k: int = 5) -> str:
+    try:
+        index = pinecone_client.Index(index_name)
+        res = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+        matches = res.get("matches", []) or []
+        texts = [m.get("metadata", {}).get("text", "") for m in matches]
+        return "\n\n---\n\n".join(texts)
+    except Exception as e:
+        print("pinecone search error:", e)
+        return ""
+
+# -------------------------
 # ENDPOINT: /analyze
 # -------------------------
-@app.post("/analyze", response_model=AnalyzeResponse, tags=["ingest"])
 async def analyze(request: AnalyzeRequest, authorization: Optional[str] = Header(None)):
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid API Key.")
@@ -315,6 +252,11 @@ async def analyze(request: AnalyzeRequest, authorization: Optional[str] = Header
 
     # 3. Optimize text for RAG
     optimized_text = await optimize_text_for_rag(combined_text)
+    
+    print("--------------------------------------------------")
+    print("CLEANED TEXT BEFORE VECTOR DB:")
+    print(optimized_text)
+    print("--------------------------------------------------")
 
     # 4. Process, chunk, embed and upsert (using optimized text)
     await process_text_and_upsert(index_name, optimized_text)
@@ -327,23 +269,8 @@ async def analyze(request: AnalyzeRequest, authorization: Optional[str] = Header
     return AnalyzeResponse(success=True, index_name=index_name, summary=summary)
 
 # -------------------------
-# HELPER: search top-k and return combined context
-# -------------------------
-def _search_index_sync(index_name: str, query_vector: list, top_k: int = 5) -> str:
-    try:
-        index = pinecone_client.Index(index_name)
-        res = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
-        matches = res.get("matches", []) or []
-        texts = [m.get("metadata", {}).get("text", "") for m in matches]
-        return "\n\n---\n\n".join(texts)
-    except Exception as e:
-        print("pinecone search error:", e)
-        return ""
-
-# -------------------------
 # ENDPOINT: /ask
 # -------------------------
-@app.post("/ask", response_model=AskResponse, tags=["query"])
 async def ask(req: AskRequest, authorization: Optional[str] = Header(None)):
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid API Key.")
@@ -358,13 +285,6 @@ async def ask(req: AskRequest, authorization: Optional[str] = Header(None)):
     if not context.strip():
         return AskResponse(answer="This information is not available in the indexed documents.")
 
-    # 3. Ask Groq with the context and return
-    answer = await answer_with_context_groq(req.question, context)
+    # 3. Ask Groq with the context and history, then return
+    answer = await answer_with_context_groq(req.question, context, req.history)
     return AskResponse(answer=answer)
-
-# -------------------------
-# Run
-# -------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
